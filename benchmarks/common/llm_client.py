@@ -68,6 +68,42 @@ class LLMClient:
         else:
             self._init_openai(api_key, base_url, timeout, **kwargs)
 
+    def _openai_chat_token_limit_kwargs(self, max_tokens: int) -> dict[str, Any]:
+        """Use the correct token limit parameter for newer OpenAI models."""
+        m = self.model.lower()
+        if m.startswith(("gpt-5", "o1", "o3", "o4")):
+            return {"max_completion_tokens": max_tokens}
+        return {"max_tokens": max_tokens}
+
+    def _openai_chat_temperature_kwargs(self, temperature: float) -> dict[str, Any]:
+        """gpt-5 / o-series only accept the default temperature; omit the field."""
+        m = self.model.lower()
+        if m.startswith(("gpt-5", "o1", "o3", "o4")):
+            return {}
+        return {"temperature": temperature}
+
+    def _parse_yes_no_judgment(self, raw: str) -> bool:
+        """Extract the final yes/no verdict from judge output."""
+        text = raw.strip()
+        if not text:
+            return False
+
+        after_cot = re.split(r"</judge_thinking>|</thinking>", text, flags=re.IGNORECASE)
+        verdict_region = after_cot[-1].strip() if after_cot else text
+        verdict_lines = [line.strip().lower() for line in verdict_region.splitlines() if line.strip()]
+
+        for line in reversed(verdict_lines):
+            if line == "yes":
+                return True
+            if line == "no":
+                return False
+
+        token_matches = re.findall(r"\b(yes|no)\b", verdict_region.lower())
+        if token_matches:
+            return token_matches[-1] == "yes"
+
+        return text.lower().startswith("yes")
+
     def _init_openai(self, api_key: str | None, base_url: str | None, timeout: float, **kwargs: Any) -> None:
         import openai
         client_kwargs: dict[str, Any] = {
@@ -133,8 +169,8 @@ class LLMClient:
                         self._client.chat.completions.create(
                             model=self.model,
                             messages=messages,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
+                            **self._openai_chat_temperature_kwargs(temperature),
+                            **self._openai_chat_token_limit_kwargs(max_tokens),
                         ),
                         timeout=self.timeout,
                     )
@@ -234,9 +270,9 @@ class LLMClient:
                         self._client.chat.completions.create(
                             model=self.model,
                             messages=messages,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
+                            **self._openai_chat_temperature_kwargs(temperature),
                             response_format={"type": "json_object"},
+                            **self._openai_chat_token_limit_kwargs(max_tokens),
                         ),
                         timeout=self.timeout,
                     )
@@ -331,4 +367,4 @@ class LLMClient:
     async def judge_yes_no(self, prompt: str) -> bool:
         """Run a yes/no judge prompt. Returns True for 'yes'."""
         raw = await self.generate(system="", user=prompt, temperature=0)
-        return raw.strip().lower().startswith("yes")
+        return self._parse_yes_no_judgment(raw)

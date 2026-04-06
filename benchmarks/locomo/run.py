@@ -76,7 +76,7 @@ from .prompts import (
     preprocess_answer,
 )
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ===============================================================================
 # CONSTANTS
@@ -498,6 +498,122 @@ async def process_question(
     return result
 
 
+async def apply_locomo_judge_to_saved_result(
+    result: dict,
+    qa: dict,
+    conv_idx: int,
+    answerer: LLMClient,
+    judge_llm: LLMClient,
+    cutoffs: list[int],
+    evidence_lookup: dict | None,
+) -> None:
+    """Fill ``cutoff_results`` using ``retrieval.search_results`` only (no Mem0)."""
+    formatted = list(result["retrieval"]["search_results"])
+    question = result["question"]
+    category = qa["category"]
+    answer = str(qa["answer"])
+    reference_date_human = result.get("reference_date")
+    user_profile = result.get("user_profile")
+
+    cutoff_results: dict[str, dict] = {}
+    processed_answer = preprocess_answer(category, answer)
+
+    ev_ctx = ""
+    if evidence_lookup:
+        for ref in qa.get("evidence", []):
+            key = (conv_idx, ref)
+            if key in evidence_lookup:
+                ev_ctx += evidence_lookup[key] + "\n"
+        ev_ctx = ev_ctx.strip()
+
+    for c in cutoffs:
+        sliced = formatted[:c]
+        label = cutoff_label(c)
+
+        gen_prompt = get_answer_generation_prompt(
+            question, sliced, reference_date=reference_date_human, user_profile=user_profile,
+        )
+        generated_answer = await answerer.generate(system="", user=gen_prompt)
+        if "ANSWER:" in generated_answer:
+            generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
+
+        if ev_ctx:
+            judge_prompt = get_judge_prompt_with_evidence(
+                category, question, processed_answer, generated_answer, ev_ctx,
+            )
+        else:
+            judge_prompt = get_judge_prompt(category, question, processed_answer, generated_answer)
+
+        raw = await judge_llm.generate_structured(
+            system=JUDGE_SYSTEM_PROMPT,
+            user=judge_prompt,
+        )
+        if isinstance(raw, dict):
+            label_val = raw.get("label", "").upper()
+            correct = label_val == "CORRECT"
+        else:
+            correct = False
+
+        score = 1.0 if correct else 0.0
+        judgment = "CORRECT" if correct else "WRONG"
+
+        cutoff_results[label] = {
+            "judgment": judgment,
+            "score": score,
+            "generated_answer": generated_answer,
+            "memories_evaluated": len(sliced),
+            "reason": raw.get("reasoning", "") if isinstance(raw, dict) else "",
+        }
+
+    result["cutoff_results"] = cutoff_results
+
+
+def expected_locomo_question_items(
+    dataset: list[dict],
+    conv_indices: list[int],
+    categories: list[int],
+    max_questions: int | None,
+) -> list[tuple[str, int, int, dict]]:
+    """(question_id, conv_idx, qa_idx, qa_dict) for every question in scope."""
+    items: list[tuple[str, int, int, dict]] = []
+    for conv_idx in conv_indices:
+        if conv_idx >= len(dataset):
+            continue
+        entry = dataset[conv_idx]
+        questions = entry.get("qa", entry.get("qa_pairs", []))
+        conv_questions = [
+            (qi, qa) for qi, qa in enumerate(questions)
+            if qa.get("category") in categories
+        ]
+        if max_questions is not None:
+            conv_questions = conv_questions[:max_questions]
+        for qi, qa in conv_questions:
+            items.append((f"conv{conv_idx}_q{qi}", conv_idx, qi, qa))
+    return items
+
+
+def locomo_predict_outputs_complete(
+    output_dir: str,
+    expected_items: list[tuple[str, int, int, dict]],
+) -> tuple[bool, list[str]]:
+    """True if every expected question has JSON with retrieval.search_results."""
+    missing: list[str] = []
+    for qid, _, _, _ in expected_items:
+        path = os.path.join(output_dir, f"{qid}.json")
+        if not os.path.isfile(path):
+            missing.append(qid)
+            continue
+        try:
+            data = json.loads(Path(path).read_text())
+        except (json.JSONDecodeError, OSError):
+            missing.append(f"{qid} (unreadable)")
+            continue
+        retr = data.get("retrieval") or {}
+        if "search_results" not in retr:
+            missing.append(f"{qid} (no search_results)")
+    return len(missing) == 0, missing
+
+
 # ===============================================================================
 # METRICS + DISPLAY
 # ===============================================================================
@@ -573,7 +689,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-workers", type=int, default=10, help="Max parallel workers")
     parser.add_argument("--output-dir", default="results/locomo", help="Output directory")
     parser.add_argument("--predict-only", action="store_true", help="Skip answer+judge, only ingest+search")
-    parser.add_argument("--evaluate-only", action="store_true", help="Skip ingest+search, load existing predict results")
+    parser.add_argument(
+        "--evaluate-only",
+        action="store_true",
+        help="Judge only: requires all predict outputs on disk (use after --predict-only or full search). No Mem0.",
+    )
+    parser.add_argument(
+        "--rejudge",
+        action="store_true",
+        help="With --evaluate-only: re-run answer+judge even if cutoff_results already exist",
+    )
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     parser.add_argument("--debug", action="store_true", help="Verbose logging")
     parser.add_argument("--score-debug", action="store_true", help="Include score breakdowns in output")
@@ -629,7 +754,80 @@ async def async_main() -> None:
         evidence_lookup = load_evidence_lookup(dataset_path)
         print(f"  Evidence lookup: {len(evidence_lookup)} entries")
 
-    # Init clients
+    answerer = LLMClient(model=args.answerer_model, provider=args.provider, rpm=args.rpm)
+    judge_provider = args.judge_provider or args.provider
+    judge_llm = LLMClient(model=args.judge_model, provider=judge_provider, rpm=args.rpm)
+
+    if args.evaluate_only:
+        expected_items = expected_locomo_question_items(
+            dataset, conv_indices, categories, args.max_questions,
+        )
+        if not expected_items:
+            print("No questions in scope (check --conversations / --categories).")
+            return
+        complete, missing = locomo_predict_outputs_complete(output_dir, expected_items)
+        if not complete:
+            print(
+                "Evaluate-only aborted: not all predict outputs are on disk. "
+                "Finish ingest+search for every in-scope question first "
+                "(full run without --predict-only, or --predict-only until complete)."
+            )
+            print(f"  Missing or invalid: {len(missing)} (showing up to 25): {missing[:25]}")
+            return
+        print(f"  Predict complete ({len(expected_items)} questions). Running judge phase (no Mem0)...")
+
+        sem = asyncio.Semaphore(args.max_workers)
+
+        async def judge_one(qid: str, conv_idx: int, qi: int, qa: dict) -> None:
+            path = os.path.join(output_dir, f"{qid}.json")
+            data = json.loads(Path(path).read_text())
+            if data.get("cutoff_results") and not args.rejudge:
+                return
+            async with sem:
+                await apply_locomo_judge_to_saved_result(
+                    data, qa, conv_idx, answerer, judge_llm, cutoffs, evidence_lookup,
+                )
+                save_result_json(path, data)
+
+        await asyncio.gather(*[
+            judge_one(qid, conv_idx, qi, qa)
+            for qid, conv_idx, qi, qa in expected_items
+        ])
+
+        all_evaluations = [
+            json.loads(Path(os.path.join(output_dir, f"{qid}.json")).read_text())
+            for qid, _, _, _ in expected_items
+        ]
+        metrics = compute_locomo_metrics(all_evaluations, cutoffs)
+        display_results(metrics, cutoffs)
+
+        run_id_meta = args.run_id or run_id
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unified_path = os.path.join(args.output_dir, f"locomo_results_{timestamp}.json")
+        save_result_json(unified_path, {
+            "metadata": {
+                "benchmark": "locomo",
+                "project_name": args.project_name,
+                "run_id": run_id_meta,
+                "timestamp": timestamp,
+                "answerer_model": args.answerer_model,
+                "judge_model": args.judge_model,
+                "provider": args.provider,
+                "top_k": args.top_k,
+                "top_k_cutoffs": [cutoff_label(c) for c in cutoffs],
+                "total_questions": len(all_evaluations),
+                "categories": categories,
+                "evaluate_only": True,
+            },
+            "metrics_by_cutoff": metrics,
+            "evaluations": all_evaluations,
+        })
+        print(f"\nResults saved to: {unified_path}")
+        print(f"\nTotal questions evaluated: {len(all_evaluations)}")
+        return
+
+    # Init Mem0 (not used for --evaluate-only)
     backend = os.getenv("MEM0_BACKEND", args.backend)
     mem0 = Mem0Client(
         mode=backend,
@@ -637,16 +835,12 @@ async def async_main() -> None:
         api_key=args.mem0_api_key if backend == "cloud" else None,
         rpm=args.rpm,
     )
-    answerer = LLMClient(model=args.answerer_model, provider=args.provider, rpm=args.rpm)
-    judge_provider = args.judge_provider or args.provider
-    judge_llm = LLMClient(model=args.judge_model, provider=judge_provider, rpm=args.rpm)
     shutdown = GracefulShutdown()
     checkpoint = Checkpoint(output_dir)
 
     all_evaluations: list[dict] = []
 
-    # Load existing results for resume
-    if args.resume or args.evaluate_only:
+    if args.resume:
         for p in sorted(Path(output_dir).glob("*.json")):
             if p.name.startswith("_"):
                 continue
@@ -657,19 +851,6 @@ async def async_main() -> None:
             except (json.JSONDecodeError, KeyError):
                 continue
         print(f"  Loaded {len(all_evaluations)} existing results")
-
-    if args.evaluate_only:
-        # Just compute metrics on existing results
-        if not all_evaluations:
-            print("No results found for evaluate-only mode.")
-            return
-        has_cutoffs = any("cutoff_results" in e for e in all_evaluations)
-        if has_cutoffs:
-            metrics = compute_locomo_metrics(all_evaluations, cutoffs)
-            display_results(metrics, cutoffs)
-        else:
-            print("Results don't have cutoff_results. Run without --evaluate-only first.")
-        return
 
     existing_ids = {e["question_id"] for e in all_evaluations}
     results_lock = asyncio.Lock()

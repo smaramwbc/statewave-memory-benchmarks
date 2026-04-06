@@ -75,7 +75,7 @@ from .prompts import (
     get_beam_nugget_judge_prompt,
 )
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ===============================================================================
 # CONSTANTS

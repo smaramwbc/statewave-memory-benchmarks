@@ -81,7 +81,7 @@ from .prompts import (
     get_judge_prompt,
 )
 
-load_dotenv()
+load_dotenv(override=True)
 
 # ===============================================================================
 # CONSTANTS
@@ -715,6 +715,138 @@ async def process_question_retrieval(
     return result
 
 
+async def apply_longmemeval_answerer_judge_to_saved_result(
+    result: dict,
+    answerer: LLMClient,
+    judge_llm: LLMClient,
+    cutoffs: list[int],
+) -> None:
+    """Fill ``cutoff_results`` from ``retrieval.search_results`` (no Mem0)."""
+    formatted = list(result["retrieval"]["search_results"])
+    question_text = result["question"]
+    question_id = result["question_id"]
+    question_type = result["question_type"]
+    answer = str(result["ground_truth_answer"])
+    question_date = result.get("question_date", "")
+    user_profile = result.get("user_profile")
+
+    question_date_human = (
+        parse_longmemeval_date_human(question_date) if question_date else ""
+    )
+
+    cutoff_results: dict[str, dict] = {}
+    for c in cutoffs:
+        sliced = formatted[:c]
+        sliced_chrono = sorted(sliced, key=lambda x: x.get("created_at") or "")
+        label = cutoff_label(c)
+
+        gen_prompt = get_answer_generation_prompt(
+            question=question_text,
+            search_results=sliced_chrono,
+            question_date=question_date_human,
+            user_profile=user_profile,
+        )
+        generated_answer = await answerer.generate(system="", user=gen_prompt)
+        generated_answer = re.sub(
+            r"[<\[]mem_thinking[>\]].*?[<\[]/mem_thinking[>\]]",
+            "",
+            generated_answer,
+            flags=re.DOTALL,
+        ).strip()
+        if "ANSWER:" in generated_answer:
+            generated_answer = generated_answer.rsplit("ANSWER:", 1)[-1].strip()
+
+        judge_prompt = get_judge_prompt(
+            question_type=question_type,
+            question_id=question_id,
+            question=question_text,
+            answer=answer,
+            response=generated_answer,
+            question_date=question_date_human,
+        )
+        correct = await judge_llm.judge_yes_no(judge_prompt)
+        score = 1.0 if correct else 0.0
+        judgment = "PASS" if correct else "FAIL"
+
+        cutoff_results[label] = {
+            "judgment": judgment,
+            "score": score,
+            "generated_answer": generated_answer,
+            "memories_evaluated": len(sliced),
+            "reason": f"Generated answer: {generated_answer[:500]}",
+        }
+
+    result["cutoff_results"] = cutoff_results
+
+
+async def apply_longmemeval_retrieval_judge_to_saved_result(
+    result: dict,
+    judge_llm: LLMClient,
+    cutoffs: list[int],
+) -> None:
+    """Fill ``cutoff_results`` using retrieval-judge prompts (no Mem0)."""
+    formatted = list(result["retrieval"]["search_results"])
+    question_text = result["question"]
+    answer = str(result["ground_truth_answer"])
+    question_date = result.get("question_date", "")
+    user_profile = result.get("user_profile")
+
+    cutoff_results: dict[str, dict] = {}
+    for c in cutoffs:
+        sliced = formatted[:c]
+        label = cutoff_label(c)
+        prompt = get_retrieval_judge_prompt(
+            question=question_text,
+            answer=answer,
+            search_results=sliced,
+            question_date=question_date,
+            user_profile=user_profile,
+        )
+        raw = await judge_llm.generate_structured(
+            system=RETRIEVAL_JUDGE_SYSTEM,
+            user=prompt,
+        )
+        if isinstance(raw, dict):
+            judgment_str = raw.get("judgment", "").upper()
+            passed = judgment_str == "PASS"
+        else:
+            passed = False
+        score = 1.0 if passed else 0.0
+        judgment = "PASS" if passed else "FAIL"
+        cutoff_results[label] = {
+            "judgment": judgment,
+            "score": score,
+            "generated_answer": raw.get("supporting_evidence", "") if isinstance(raw, dict) else "",
+            "memories_evaluated": len(sliced),
+            "reason": raw.get("reason", "") if isinstance(raw, dict) else "",
+            "core_intent": raw.get("core_intent", "") if isinstance(raw, dict) else "",
+            "core_intent_supported": raw.get("core_intent_supported", False) if isinstance(raw, dict) else False,
+        }
+
+    result["cutoff_results"] = cutoff_results
+
+
+def longmemeval_predict_outputs_complete(
+    output_dir: str,
+    question_ids: list[str],
+) -> tuple[bool, list[str]]:
+    missing: list[str] = []
+    for qid in question_ids:
+        path = os.path.join(output_dir, f"{qid}.json")
+        if not os.path.isfile(path):
+            missing.append(qid)
+            continue
+        try:
+            data = json.loads(Path(path).read_text())
+        except (json.JSONDecodeError, OSError):
+            missing.append(f"{qid} (unreadable)")
+            continue
+        retr = data.get("retrieval") or {}
+        if "search_results" not in retr:
+            missing.append(f"{qid} (no search_results)")
+    return len(missing) == 0, missing
+
+
 # ===============================================================================
 # METRICS + DISPLAY
 # ===============================================================================
@@ -838,7 +970,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--evaluate-only", action="store_true",
-        help="Skip ingest+search, load existing predict results and evaluate",
+        help="Judge only: requires all predict JSONs on disk. No Mem0.",
+    )
+    parser.add_argument(
+        "--rejudge",
+        action="store_true",
+        help="With --evaluate-only: re-run judge even if cutoff_results exist",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -964,14 +1101,6 @@ async def async_main() -> None:
     for qtype in sorted(type_counts.keys()):
         print(f"    {qtype}: {type_counts[qtype]}")
 
-    # Init clients
-    backend = os.getenv("MEM0_BACKEND", args.backend)
-    mem0 = Mem0Client(
-        mode=backend,
-        host=args.mem0_host,
-        api_key=args.mem0_api_key if backend == "cloud" else None,
-        rpm=args.rpm,
-    )
     answerer = LLMClient(
         model=args.answerer_model, provider=args.provider, rpm=args.rpm,
     )
@@ -979,13 +1108,130 @@ async def async_main() -> None:
     judge_llm = LLMClient(
         model=args.judge_model, provider=judge_provider, rpm=args.rpm,
     )
+
+    if args.evaluate_only:
+        if not questions_to_process:
+            print("No questions in scope.")
+            return
+        expected_ids = [q["question_id"] for q in questions_to_process]
+        complete, missing = longmemeval_predict_outputs_complete(output_dir, expected_ids)
+        if not complete:
+            print(
+                "Evaluate-only aborted: not all predict outputs are on disk. "
+                "Finish ingest+search for every in-scope question first."
+            )
+            print(f"  Missing or invalid: {len(missing)} (showing up to 25): {missing[:25]}")
+            return
+        print(f"  Predict complete ({len(expected_ids)} questions). Running judge phase (no Mem0)...")
+
+        sem = asyncio.Semaphore(args.max_workers)
+        progress = {"done": 0, "total": len(questions_to_process)}
+        live_scores = {
+            cutoff_label(c): {"seen": 0, "passed": 0}
+            for c in cutoffs
+        }
+        progress_lock = asyncio.Lock()
+        pbar = tqdm(total=progress["total"], desc="Rejudge", leave=True)
+
+        def update_progress_postfix(data: dict) -> None:
+            cutoff_results = data.get("cutoff_results", {})
+            for label in live_scores:
+                result = cutoff_results.get(label)
+                if not result:
+                    continue
+                live_scores[label]["seen"] += 1
+                if result.get("score", 0.0) >= 0.5:
+                    live_scores[label]["passed"] += 1
+
+            summary = {}
+            for label, stats in live_scores.items():
+                seen = stats["seen"]
+                if not seen:
+                    continue
+                summary[label.replace("top_", "t")] = f"{(stats['passed'] / seen) * 100:.1f}%"
+            if summary:
+                pbar.set_postfix(summary)
+
+        async def judge_one(question: dict) -> None:
+            qid = question["question_id"]
+            path = os.path.join(output_dir, f"{qid}.json")
+            data = json.loads(Path(path).read_text())
+            if data.get("cutoff_results") and not args.rejudge:
+                async with progress_lock:
+                    update_progress_postfix(data)
+                    progress["done"] += 1
+                    pbar.update(1)
+                return
+            async with sem:
+                if args.mode == "retrieval":
+                    await apply_longmemeval_retrieval_judge_to_saved_result(
+                        data, judge_llm, cutoffs,
+                    )
+                else:
+                    await apply_longmemeval_answerer_judge_to_saved_result(
+                        data, answerer, judge_llm, cutoffs,
+                    )
+                save_result_json(path, data)
+            async with progress_lock:
+                update_progress_postfix(data)
+                progress["done"] += 1
+                pbar.update(1)
+
+        await asyncio.gather(*[judge_one(q) for q in questions_to_process])
+        pbar.close()
+
+        all_evaluations = [
+            json.loads(Path(os.path.join(output_dir, f"{qid}.json")).read_text())
+            for qid in expected_ids
+        ]
+        metrics = compute_longmemeval_metrics(all_evaluations, cutoffs)
+        display_results(metrics, cutoffs)
+
+        run_id_meta = args.run_id or run_id
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unified_path = os.path.join(
+            args.output_dir, f"longmemeval_results_{timestamp}.json",
+        )
+        save_result_json(unified_path, {
+            "metadata": {
+                "benchmark": "longmemeval",
+                "project_name": args.project_name,
+                "run_id": run_id_meta,
+                "timestamp": timestamp,
+                "mode": args.mode,
+                "answerer_model": args.answerer_model,
+                "judge_model": args.judge_model,
+                "provider": args.provider,
+                "top_k": args.top_k,
+                "top_k_cutoffs": [cutoff_label(c) for c in cutoffs],
+                "total_questions": len(all_evaluations),
+                "question_types": sorted(type_counts.keys()),
+                "all_questions": args.all_questions,
+                "per_type": args.per_type,
+                "seed": args.seed,
+                "evaluate_only": True,
+            },
+            "metrics_by_cutoff": metrics,
+            "evaluations": all_evaluations,
+        })
+        print(f"\nResults saved to: {unified_path}")
+        print(f"\nTotal questions evaluated: {len(all_evaluations)}")
+        return
+
+    backend = os.getenv("MEM0_BACKEND", args.backend)
+    mem0 = Mem0Client(
+        mode=backend,
+        host=args.mem0_host,
+        api_key=args.mem0_api_key if backend == "cloud" else None,
+        rpm=args.rpm,
+    )
     shutdown = GracefulShutdown()
     checkpoint = Checkpoint(output_dir)
 
     all_evaluations: list[dict] = []
 
-    # Load existing results for resume / evaluate-only
-    if args.resume or args.evaluate_only:
+    if args.resume:
         for p in sorted(Path(output_dir).glob("*.json")):
             if p.name.startswith("_"):
                 continue
@@ -996,22 +1242,6 @@ async def async_main() -> None:
             except (json.JSONDecodeError, KeyError):
                 continue
         print(f"  Loaded {len(all_evaluations)} existing results")
-
-    if args.evaluate_only:
-        # Just compute metrics on existing results
-        if not all_evaluations:
-            print("No results found for evaluate-only mode.")
-            return
-        has_cutoffs = any("cutoff_results" in e for e in all_evaluations)
-        if has_cutoffs:
-            metrics = compute_longmemeval_metrics(all_evaluations, cutoffs)
-            display_results(metrics, cutoffs)
-        else:
-            print(
-                "Results don't have cutoff_results. "
-                "Run without --evaluate-only first."
-            )
-        return
 
     existing_ids = {e["question_id"] for e in all_evaluations}
 
