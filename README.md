@@ -1,6 +1,6 @@
 # Memory Benchmarks
 
-Open-source evaluation suite for memory-augmented LLM systems. Run standard benchmarks against [Mem0](https://github.com/mem0ai/mem0) to measure memory recall, extraction quality, and retrieval accuracy.
+Open-source evaluation suite to run benchmarks on memory-augmented LLM systems. Currently supports the [Mem0](https://github.com/mem0ai/mem0) Cloud and OSS versions to measure memory recall, extraction quality, and retrieval accuracy.
 
 ## Benchmarks
 
@@ -12,18 +12,47 @@ Open-source evaluation suite for memory-augmented LLM systems. Run standard benc
 
 ## Quick Start
 
-### 1. Prerequisites
-
-- Docker and Docker Compose
-- Python 3.10+
-- An OpenAI API key (or see [Custom Models](#custom-models) for alternatives)
-
-### 2. Start Mem0
-
 ```bash
 git clone https://github.com/mem0ai/memory-benchmarks.git
 cd memory-benchmarks
+pip install -r requirements.txt
+```
 
+### Option A: Mem0 Cloud
+
+No Docker required. You need a [Mem0 API key](https://app.mem0.ai) and an OpenAI API key (for the answerer/judge LLM).
+
+```bash
+# Set your keys
+export MEM0_API_KEY=m0-your-key
+export OPENAI_API_KEY=sk-your-key
+
+# Run a benchmark
+python -m benchmarks.locomo.run \
+  --project-name my-first-test \
+  --backend cloud \
+  --mem0-api-key $MEM0_API_KEY
+
+# LongMemEval (500 questions)
+python -m benchmarks.longmemeval.run \
+  --project-name my-first-test \
+  --backend cloud \
+  --mem0-api-key $MEM0_API_KEY \
+  --all-questions
+
+# BEAM (configurable size)
+python -m benchmarks.beam.run \
+  --project-name my-first-test \
+  --backend cloud \
+  --mem0-api-key $MEM0_API_KEY \
+  --chat-sizes 100K --conversations 0-9
+```
+
+### Option B: Mem0 OSS (Self-Hosted)
+
+Requires Docker and Docker Compose. This starts a local Mem0 server backed by Qdrant.
+
+```bash
 cp .env.example .env
 # Edit .env and add your OPENAI_API_KEY
 
@@ -32,15 +61,7 @@ docker compose up -d
 # Qdrant:      http://localhost:6333
 ```
 
-This starts the full Mem0 system — semantic search, BM25 keyword search, entity extraction and linking — backed by Qdrant.
-
-### 3. Install Python dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Run a benchmark
+Then run benchmarks against your local server:
 
 ```bash
 # LOCOMO (fastest — ~300 questions, 10 conversations)
@@ -53,7 +74,9 @@ python -m benchmarks.longmemeval.run --project-name my-first-test --all-question
 python -m benchmarks.beam.run --project-name my-first-test --chat-sizes 100K --conversations 0-9
 ```
 
-### 5. View results in the UI
+By default, the OSS server uses OpenAI for fact extraction (`gpt-4o-mini`) and embeddings (`text-embedding-3-small`). See [Custom Models](#custom-models) for using Azure, Ollama, or other providers.
+
+### View results in the UI
 
 ```bash
 npm install
@@ -126,18 +149,6 @@ See `configs/` for examples:
 - `configs/openai.yaml` — OpenAI (default)
 - `configs/azure-openai.yaml` — Azure OpenAI
 - `configs/ollama.yaml` — Fully local with Ollama (no API keys)
-
-### Using Mem0 Cloud
-
-To benchmark against the hosted Mem0 platform instead of self-hosted:
-
-```bash
-python -m benchmarks.locomo.run \
-  --project-name cloud-test \
-  --backend cloud \
-  --mem0-api-key m0-your-key \
-  --mem0-host https://api.mem0.ai
-```
 
 ## Results
 
