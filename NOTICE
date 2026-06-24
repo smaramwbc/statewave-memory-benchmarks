@@ -1,0 +1,27 @@
+Statewave benchmark fork
+========================
+
+This project is a fork of mem0's memory-benchmark suite:
+    https://github.com/mem0ai/memory-benchmarks
+Original work Copyright (c) mem0ai, licensed under the Apache License,
+Version 2.0 (see the LICENSE file).
+
+Modifications by the Statewave team (2026), per Apache 2.0 section 4(b):
+  - Added a Statewave retrieval adapter (benchmarks/common/statewave_client.py)
+    and a `--backend statewave` dispatch across the benchmark runners.
+  - Harness fixes to the mem0 cloud/OSS clients: cloud v3 add URL, OSS v2
+    search-filter semantics, OSS message-content date grounding, and
+    concurrency in the BEAM ingestion loop.
+  - statewave_results/: a head-to-head comparison of Statewave, mem0 cloud,
+    and mem0 OSS, plus the writeup and charts.
+
+Benchmark datasets are NOT redistributed in this repository. They are fetched
+from their original sources at runtime and remain the property of their authors
+under their own licenses:
+  - LoCoMo        — Maharana et al.
+  - LongMemEval   — Wu et al.
+  - BEAM          — Tavakoli et al. (ICLR 2026, arXiv:2510.27246; CC BY-SA 4.0)
+
+"mem0" is a trademark of its respective owner. References to mem0 in this
+repository are nominative, for benchmark-comparison purposes only, and do not
+imply any affiliation with or endorsement by mem0ai.

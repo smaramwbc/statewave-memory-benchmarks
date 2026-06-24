@@ -118,7 +118,17 @@ def download_dataset(
 
         logger.info("Downloading BEAM %s dataset from HuggingFace...", size)
         try:
-            from datasets import load_dataset as hf_load
+            # The local ./datasets data dir shadows the HF `datasets` package on
+            # sys.path; drop cwd/repo-root for this import so HF wins.
+            import sys as _sys
+            _saved = [p for p in _sys.path if p in ("", ".", os.getcwd())]
+            for _p in _saved:
+                _sys.path.remove(_p)
+            try:
+                from datasets import load_dataset as hf_load
+            finally:
+                for _p in _saved:
+                    _sys.path.insert(0, _p)
 
             if size == "10M":
                 ds = hf_load(HF_DATASET_10M, split="10M")
@@ -955,8 +965,8 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated question types to evaluate (default: all)",
     )
     parser.add_argument("--rpm", type=int, default=200, help="Requests per minute for LLM")
-    parser.add_argument("--backend", default="oss", choices=["oss", "cloud"],
-                        help="Mem0 backend: 'oss' for self-hosted server (default), 'cloud' for api.mem0.ai")
+    parser.add_argument("--backend", default="oss", choices=["oss", "cloud", "statewave"],
+                        help="Memory backend: 'oss'/'cloud' = mem0; 'statewave' = Statewave server (head-to-head)")
     parser.add_argument("--mem0-host", default=None,
                         help="Mem0 server URL")
     parser.add_argument("--mem0-api-key", default=None,
@@ -1021,12 +1031,20 @@ async def async_main() -> None:
 
     # Init clients
     backend = os.getenv("MEM0_BACKEND", args.backend)
-    mem0 = Mem0Client(
-        mode=backend,
-        host=args.mem0_host,
-        api_key=args.mem0_api_key if backend == "cloud" else None,
-        rpm=args.rpm,
-    )
+    if backend == "statewave":
+        from benchmarks.common.statewave_client import StatewaveClient
+
+        mem0 = StatewaveClient(
+            host=os.getenv("STATEWAVE_URL"),
+            api_key=os.getenv("STATEWAVE_API_KEY"),
+        )
+    else:
+        mem0 = Mem0Client(
+            mode=backend,
+            host=args.mem0_host,
+            api_key=args.mem0_api_key if backend == "cloud" else None,
+            rpm=args.rpm,
+        )
     answerer = LLMClient(
         model=args.answerer_model, provider=args.provider, rpm=args.rpm
     )
@@ -1071,6 +1089,29 @@ async def async_main() -> None:
     async with mem0:
         with shutdown:
             # === Phase 1: Ingestion ===
+            # Parallelize across conversations (mirrors locomo/run.py). The cloud
+            # backend's add() is asynchronous (~15-45s wall-clock per 2-turn
+            # chunk: POST returns PENDING, then we poll the event), so a serial
+            # ingest never finishes at BEAM scale. Bounded by --max-workers.
+            ingest_sem = asyncio.Semaphore(args.max_workers)
+
+            async def _ingest_one(size: str, ci: int, conv: dict):
+                async with ingest_sem:
+                    if shutdown.requested:
+                        return size, ci, False, None
+                    success, user_id, _chunks = await ingest_conversation(
+                        chat_size=size,
+                        conv_idx=ci,
+                        conversation=conv,
+                        mem0=mem0,
+                        logger=logger,
+                        run_id=run_id,
+                        output_dir=output_dir,
+                        shutdown=shutdown,
+                        debug=args.debug,
+                    )
+                    return size, ci, success, user_id
+
             for size in chat_sizes:
                 convs = dataset[size]
                 indices = [i for i in conv_indices if i < len(convs)]
@@ -1083,26 +1124,18 @@ async def async_main() -> None:
                     )
                     continue
 
-                print(f"\n=== Ingesting {len(indices)} {size} conversations ===")
+                print(
+                    f"\n=== Ingesting {len(indices)} {size} conversations "
+                    f"(concurrency={args.max_workers}) ==="
+                )
 
-                for ci in indices:
-                    if shutdown.requested:
-                        break
-
-                    success, user_id, chunks = await ingest_conversation(
-                        chat_size=size,
-                        conv_idx=ci,
-                        conversation=convs[ci],
-                        mem0=mem0,
-                        logger=logger,
-                        run_id=run_id,
-                        output_dir=output_dir,
-                        shutdown=shutdown,
-                        debug=args.debug,
-                    )
-                    conv_user_ids[(size, ci)] = user_id
+                tasks = [_ingest_one(size, ci, convs[ci]) for ci in indices]
+                for fut in asyncio.as_completed(tasks):
+                    size_r, ci_r, success, user_id = await fut
+                    if user_id is not None:
+                        conv_user_ids[(size_r, ci_r)] = user_id
                     if not success:
-                        logger.warning("[%s][%d] Had failures during ingestion", size, ci)
+                        logger.warning("[%s][%d] Had failures during ingestion", size_r, ci_r)
 
             if shutdown.requested:
                 print("Shutdown requested -- progress saved. Re-run to resume.")

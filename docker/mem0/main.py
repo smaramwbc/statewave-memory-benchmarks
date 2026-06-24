@@ -178,6 +178,7 @@ class AddRequest(BaseModel):
     run_id: str | None = None
     metadata: dict[str, Any] | None = None
     observation_date: str | None = None
+    timestamp: int | None = None
     custom_instructions: str | None = None
 
 
@@ -213,8 +214,14 @@ def add_memories(req: AddRequest):
         params["run_id"] = req.run_id
     if req.metadata:
         params["metadata"] = req.metadata
-    # observation_date and custom_instructions: pass through only if
-    # the installed mem0ai version supports them
+    # NOTE: mem0's OSS Memory SDK does NOT accept a per-memory historical
+    # `timestamp` (it raises "The timestamp parameter is not supported by the OSS
+    # Memory SDK." — it's a cloud-only feature). So the OSS backend cannot be fed
+    # the session date and grounds memories to ingest time. This is a real mem0
+    # OSS limitation: on a benchmark with dated historical sessions, OSS temporal
+    # questions fail wholesale. We therefore exclude mem0 OSS from temporal
+    # categories in any fair comparison (documented in the results), rather than
+    # forwarding a timestamp the SDK rejects.
     if req.custom_instructions:
         params["prompt"] = req.custom_instructions
 
@@ -231,14 +238,17 @@ def search_memories(req: SearchRequest):
     """Search memories by semantic similarity + BM25 + entity boost."""
     mem = _get_memory()
     params: dict[str, Any] = {"limit": req.limit}
+    # Newer mem0ai search() rejects top-level user_id/agent_id/run_id and
+    # requires them inside filters={...} (v2 search semantics).
+    filters: dict[str, Any] = dict(req.filters) if req.filters else {}
     if req.user_id:
-        params["user_id"] = req.user_id
+        filters["user_id"] = req.user_id
     if req.agent_id:
-        params["agent_id"] = req.agent_id
+        filters["agent_id"] = req.agent_id
     if req.run_id:
-        params["run_id"] = req.run_id
-    if req.filters:
-        params["filters"] = req.filters
+        filters["run_id"] = req.run_id
+    if filters:
+        params["filters"] = filters
     if req.rerank:
         params["rerank"] = True
 

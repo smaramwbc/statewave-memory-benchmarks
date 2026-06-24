@@ -1,0 +1,21 @@
+# mem0 OSS config — gpt-4o stack (in-harness comparison).
+# Embedder = OpenAI text-embedding-3-small (1536); LLM (extraction) = gpt-4o-mini
+# (the gpt-4o-stack default). Fresh 1536 Qdrant collection.
+version: v1.1
+llm:
+  provider: openai
+  config:
+    model: ${LLM_MODEL}
+    temperature: 0.1
+embedder:
+  provider: openai
+  config:
+    model: text-embedding-3-small
+    embedding_dims: 1536
+vector_store:
+  provider: qdrant
+  config:
+    host: qdrant
+    port: 6333
+    collection_name: memories_te3
+    embedding_model_dims: 1536

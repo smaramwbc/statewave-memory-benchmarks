@@ -1033,8 +1033,8 @@ def parse_args() -> argparse.Namespace:
         help="Requests per minute for LLM",
     )
     parser.add_argument(
-        "--backend", default="oss", choices=["oss", "cloud"],
-        help="Mem0 backend: 'oss' for self-hosted server (default), 'cloud' for api.mem0.ai",
+        "--backend", default="oss", choices=["oss", "cloud", "statewave"],
+        help="Memory backend: 'oss'/'cloud' = mem0; 'statewave' = Statewave server (head-to-head)",
     )
     parser.add_argument(
         "--mem0-host", default=None,
@@ -1231,12 +1231,20 @@ async def async_main() -> None:
         return
 
     backend = os.getenv("MEM0_BACKEND", args.backend)
-    mem0 = Mem0Client(
-        mode=backend,
-        host=args.mem0_host,
-        api_key=args.mem0_api_key if backend == "cloud" else None,
-        rpm=args.rpm,
-    )
+    if backend == "statewave":
+        from benchmarks.common.statewave_client import StatewaveClient
+
+        mem0 = StatewaveClient(
+            host=os.getenv("STATEWAVE_URL"),
+            api_key=os.getenv("STATEWAVE_API_KEY"),
+        )
+    else:
+        mem0 = Mem0Client(
+            mode=backend,
+            host=args.mem0_host,
+            api_key=args.mem0_api_key if backend == "cloud" else None,
+            rpm=args.rpm,
+        )
     shutdown = GracefulShutdown()
     checkpoint = Checkpoint(output_dir)
 

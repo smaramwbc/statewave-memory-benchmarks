@@ -135,8 +135,33 @@ class Mem0Client:
     async def _add_oss(
         self, messages, user_id, observation_date, timestamp, custom_instructions, metadata,
     ) -> dict | None:
-        """Add via OSS server — synchronous endpoint, no event polling."""
+        """Add via OSS server — synchronous endpoint, no event polling.
+
+        The mem0 OSS Memory SDK rejects a per-memory historical `timestamp`
+        kwarg (cloud-only), so the OSS server drops it. To deliver the session
+        date through the channel OSS *does* honor, we prepend the absolute date
+        to each message's content — the extractor preserves dates written in
+        text (verified empirically). This is the equal-information equivalent of
+        the timestamp param that Statewave (event_time) and mem0 cloud (v3
+        timestamp) receive, so OSS is scored on the full set incl. temporal
+        rather than being date-deprived.
+        """
         session = await self._get_session()
+
+        # Ground the session date via content (OSS drops the timestamp param).
+        date_str = None
+        if timestamp is not None:
+            try:
+                date_str = datetime.fromtimestamp(int(timestamp), tz=timezone.utc).strftime("%Y-%m-%d")
+            except (ValueError, OSError, TypeError):
+                date_str = None
+        elif observation_date:
+            date_str = observation_date
+        if date_str:
+            messages = [
+                {**m, "content": f"[{date_str}] {m.get('content', '')}"}
+                for m in messages
+            ]
 
         payload: dict[str, Any] = {"messages": messages, "user_id": user_id}
         if timestamp is not None:
@@ -205,7 +230,10 @@ class Mem0Client:
         for attempt in range(self.max_retries):
             try:
                 async with self.limiter:
-                    async with session.post(f"{self.host}/v3/memories/", json=payload) as resp:
+                    # Correct V3 add endpoint is /v3/memories/add/ (the bare
+                    # /v3/memories/ is GET-memories and 400s with "filters
+                    # required"). The published harness used the wrong URL.
+                    async with session.post(f"{self.host}/v3/memories/add/", json=payload) as resp:
                         resp.raise_for_status()
                         resp_data = await resp.json()
 

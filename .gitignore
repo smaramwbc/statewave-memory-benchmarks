@@ -17,6 +17,8 @@ results/
 !results/platform/**
 !results/oss/
 !results/oss/**
+!results/statewave_comparison/
+!results/statewave_comparison/**
 datasets/
 logs/
 evaluation_results/
@@ -38,3 +40,4 @@ tsconfig.tsbuildinfo
 next-env.d.ts
 mem0-config.yaml
 mem0-config-*.yaml
+*.bak
