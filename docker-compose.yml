@@ -24,9 +24,8 @@ services:
       - EMBEDDER_MODEL=${EMBEDDER_MODEL:-text-embedding-3-small}
     volumes:
       - mem0_history:/app/history
-      # Custom config for advanced setups (Azure, Ollama, SageMaker, etc.)
-      # Uncomment and point to your config file:
-      # - ./mem0-config.yaml:/app/config.yaml:ro
+      # mem0-stack rebuild: Qwen3-Embedding-0.6B (768-dim) embedder via local server
+      - ./mem0-config.yaml:/app/config.yaml:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
