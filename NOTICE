@@ -12,8 +12,8 @@ Modifications by the Statewave team (2026), per Apache 2.0 section 4(b):
   - Harness fixes to the mem0 cloud/OSS clients: cloud v3 add URL, OSS v2
     search-filter semantics, OSS message-content date grounding, and
     concurrency in the BEAM ingestion loop.
-  - statewave_results/: a head-to-head comparison of Statewave, mem0 cloud,
-    and mem0 OSS, plus the writeup and charts.
+  - results/statewave_comparison/: a head-to-head comparison of Statewave,
+    mem0 cloud, and mem0 OSS, plus the writeup and charts.
 
 Benchmark datasets are NOT redistributed in this repository. They are fetched
 from their original sources at runtime and remain the property of their authors
