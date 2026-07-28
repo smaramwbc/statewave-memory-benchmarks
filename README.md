@@ -3,6 +3,12 @@
 A fair, in-harness comparison of **Statewave**, **mem0 cloud**, and **mem0 OSS** on
 long-term-memory benchmarks. One fixed setup — only the memory system changes.
 
+> **Part of [Statewave](https://github.com/smaramwbc/statewave)** — the open-source memory runtime for AI agents.
+>
+> 📦 [Core runtime](https://github.com/smaramwbc/statewave) · 🐍 [Python SDK](https://github.com/smaramwbc/statewave-py) · 🟦 [TypeScript SDK](https://github.com/smaramwbc/statewave-ts) · 🔌 [Connectors](https://github.com/smaramwbc/statewave-connectors) · 📘 [Docs](https://github.com/smaramwbc/statewave-docs) · 💡 [Examples](https://github.com/smaramwbc/statewave-examples) · 🖥️ [Admin](https://github.com/smaramwbc/statewave-admin) · 🌐 [statewave.ai](https://statewave.ai)
+>
+> 📋 **Issues & feature requests:** [statewave/issues](https://github.com/smaramwbc/statewave/issues) (centralized tracker)
+
 > Fork of [`mem0ai/memory-benchmarks`](https://github.com/mem0ai/memory-benchmarks)
 > (Apache 2.0). mem0's judge and scoring code are unchanged. We added a Statewave
 > retrieval adapter plus a few harness fixes that **help the mem0 backends**: the
